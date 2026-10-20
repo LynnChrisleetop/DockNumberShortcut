@@ -1,17 +1,15 @@
 # Dock 数字快捷键
 
-这是一个免费的原生 macOS 菜单栏程序，用全局快捷键控制常用应用：
+这是一个免费的原生 macOS 菜单栏程序，用全局快捷键控制 Dock 中的应用。
+
+程序会自动读取当前 Dock 的应用顺序：
 
 - `Command + 1`：访达
-- `Command + 2`：Cursor
-- `Command + 3`：ChatGPT
-- `Command + 4`：Microsoft Edge
-- `Command + 5`：飞书
-- `Command + 6`：网易云音乐
-- `Command + 7`：App
-- `Command + 8`：系统设置
+- `Command + 2` 及之后：按 Dock 中的应用顺序对应
+- 最多支持到 `Command + 9`
 
 应用未运行时会打开；已经运行但不在前台时会切换到前台；已经在前台时再次按下会隐藏它。
+程序每 2 秒检查一次 Dock 顺序。你拖动 Dock 中的应用后，快捷键会自动更新。
 
 ## 编译
 

@@ -17,6 +17,7 @@
 @property(nonatomic, strong) NSArray<AppSlot *> *slots;
 @property(nonatomic) EventHandlerRef eventHandler;
 @property(nonatomic) NSMutableArray<NSValue *> *hotKeyRefs;
+@property(nonatomic, strong) NSTimer *refreshTimer;
 - (void)toggleSlotNumber:(NSInteger)number;
 @end
 
@@ -58,35 +59,102 @@ static AppSlot *Slot(
     return slot;
 }
 
+static UInt32 KeyCodeForNumber(NSInteger number) {
+    // macOS virtual key codes for the number row: 1 2 3 4 5 6 7 8 9.
+    static const UInt32 keyCodes[] = {18, 19, 20, 21, 23, 22, 26, 28, 25};
+    if (number < 1 || number > 9) return 0;
+    return keyCodes[number - 1];
+}
+
+static NSArray<AppSlot *> *ReadDockSlots(void) {
+    NSMutableArray<AppSlot *> *slots = [NSMutableArray array];
+
+    // Finder is always displayed first in the Dock, but macOS does not
+    // include it in com.apple.dock's persistent-apps list.
+    [slots addObject:Slot(
+        1,
+        KeyCodeForNumber(1),
+        @"访达",
+        @"com.apple.finder",
+        @"/System/Library/CoreServices/Finder.app"
+    )];
+
+    CFPropertyListRef value = CFPreferencesCopyAppValue(
+        CFSTR("persistent-apps"),
+        CFSTR("com.apple.dock")
+    );
+    NSArray *items = CFBridgingRelease(value);
+    if (![items isKindOfClass:[NSArray class]]) return slots;
+
+    NSInteger number = 2;
+    for (NSDictionary *tile in items) {
+        if (number > 9 || ![tile isKindOfClass:[NSDictionary class]]) break;
+
+        NSDictionary *tileData = tile[@"tile-data"];
+        NSDictionary *fileData = tileData[@"file-data"];
+        NSString *bundleIdentifier = tileData[@"bundle-identifier"];
+        NSString *fileURLString = fileData[@"_CFURLString"];
+
+        if (![fileURLString isKindOfClass:[NSString class]]) continue;
+        NSURL *url = [NSURL URLWithString:fileURLString];
+        NSString *path = url.path;
+        if (path.length == 0) continue;
+
+        if (bundleIdentifier.length == 0) {
+            bundleIdentifier = [[NSBundle bundleWithPath:path] bundleIdentifier];
+        }
+        if (bundleIdentifier.length == 0 ||
+            [bundleIdentifier isEqualToString:@"com.apple.finder"]) {
+            continue;
+        }
+
+        BOOL duplicate = NO;
+        for (AppSlot *existing in slots) {
+            if ([existing.bundleIdentifier isEqualToString:bundleIdentifier]) {
+                duplicate = YES;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        NSString *name = [[NSFileManager defaultManager] displayNameAtPath:path];
+        if (name.length == 0) {
+            name = [[NSBundle bundleWithPath:path]
+                objectForInfoDictionaryKey:@"CFBundleDisplayName"];
+        }
+        if (name.length == 0) name = bundleIdentifier;
+
+        [slots addObject:Slot(
+            number,
+            KeyCodeForNumber(number),
+            name,
+            bundleIdentifier,
+            path
+        )];
+        number += 1;
+    }
+
+    return slots;
+}
+
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-
-    self.slots = @[
-        Slot(1, 18, @"访达", @"com.apple.finder", @"/System/Library/CoreServices/Finder.app"),
-        Slot(2, 19, @"Cursor", @"com.todesktop.230313mzl4w4u92", @"/Applications/Cursor.app"),
-        Slot(3, 20, @"ChatGPT", @"com.openai.codex", @"/Applications/ChatGPT.app"),
-        Slot(4, 21, @"Microsoft Edge", @"com.microsoft.edgemac", @"/Applications/Microsoft Edge.app"),
-        Slot(5, 23, @"飞书", @"com.electron.lark", @"/Applications/Lark.app"),
-        Slot(6, 22, @"网易云音乐", @"com.netease.163music", @"/Applications/NeteaseMusic.app"),
-        Slot(7, 26, @"App", @"com.apple.apps.launcher", @"/System/Applications/Apps.app"),
-        Slot(8, 28, @"系统设置", @"com.apple.systempreferences", @"/System/Applications/System Settings.app")
-    ];
+    self.slots = ReadDockSlots();
 
     [self createStatusItem];
     [self installHotKeyHandler];
     [self registerHotKeys];
+    self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                           target:self
+                                                         selector:@selector(refreshDockSlots)
+                                                         userInfo:nil
+                                                          repeats:YES];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    for (NSValue *value in self.hotKeyRefs) {
-        EventHotKeyRef ref = NULL;
-        [value getValue:&ref];
-        if (ref) {
-            UnregisterEventHotKey(ref);
-        }
-    }
+    [self unregisterHotKeys];
     if (self.eventHandler) {
         RemoveEventHandler(self.eventHandler);
     }
@@ -96,7 +164,10 @@ static AppSlot *Slot(
     self.statusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:24.0];
     self.statusItem.button.title = @"⌘";
+    [self rebuildMenu];
+}
 
+- (void)rebuildMenu {
     NSMenu *menu = [NSMenu new];
     NSMenuItem *heading = [[NSMenuItem alloc]
         initWithTitle:@"Dock 数字快捷键"
@@ -118,7 +189,7 @@ static AppSlot *Slot(
 
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *info = [[NSMenuItem alloc]
-        initWithTitle:@"已按当前 Dock 顺序设置"
+        initWithTitle:@"自动读取 Dock 当前顺序"
         action:nil
         keyEquivalent:@""];
     info.enabled = NO;
@@ -131,6 +202,30 @@ static AppSlot *Slot(
     quit.target = self;
     [menu addItem:quit];
     self.statusItem.menu = menu;
+}
+
+- (void)refreshDockSlots {
+    NSArray<AppSlot *> *newSlots = ReadDockSlots();
+    if (newSlots.count != self.slots.count) {
+        [self unregisterHotKeys];
+        self.slots = newSlots;
+        [self registerHotKeys];
+        [self rebuildMenu];
+        return;
+    }
+
+    for (NSUInteger index = 0; index < newSlots.count; index++) {
+        AppSlot *oldSlot = self.slots[index];
+        AppSlot *newSlot = newSlots[index];
+        if (![oldSlot.bundleIdentifier isEqualToString:newSlot.bundleIdentifier] ||
+            ![oldSlot.path isEqualToString:newSlot.path]) {
+            [self unregisterHotKeys];
+            self.slots = newSlots;
+            [self registerHotKeys];
+            [self rebuildMenu];
+            return;
+        }
+    }
 }
 
 - (void)openFromMenu:(NSMenuItem *)sender {
@@ -175,6 +270,17 @@ static AppSlot *Slot(
         );
         [self.hotKeyRefs addObject:[NSValue valueWithPointer:ref]];
     }
+}
+
+- (void)unregisterHotKeys {
+    for (NSValue *value in self.hotKeyRefs) {
+        EventHotKeyRef ref = NULL;
+        [value getValue:&ref];
+        if (ref) {
+            UnregisterEventHotKey(ref);
+        }
+    }
+    self.hotKeyRefs = [NSMutableArray array];
 }
 
 - (void)toggleSlotNumber:(NSInteger)number {
