@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 @interface AppSlot : NSObject
 @property(nonatomic) NSInteger number;
@@ -18,6 +19,8 @@
 @property(nonatomic) EventHandlerRef eventHandler;
 @property(nonatomic) NSMutableArray<NSValue *> *hotKeyRefs;
 @property(nonatomic, strong) NSTimer *refreshTimer;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *nextWindowIndices;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *knownWindowCounts;
 - (void)toggleSlotNumber:(NSInteger)number;
 @end
 
@@ -142,6 +145,8 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.slots = ReadDockSlots();
+    self.nextWindowIndices = [NSMutableDictionary dictionary];
+    self.knownWindowCounts = [NSMutableDictionary dictionary];
 
     [self createStatusItem];
     [self installHotKeyHandler];
@@ -283,6 +288,63 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     self.hotKeyRefs = [NSMutableArray array];
 }
 
+- (NSArray<NSValue *> *)accessibilityWindowsForApplication:(NSRunningApplication *)application {
+    AXUIElementRef applicationElement =
+        AXUIElementCreateApplication(application.processIdentifier);
+    if (!applicationElement) return @[];
+
+    CFTypeRef windowsValue = NULL;
+    AXError error = AXUIElementCopyAttributeValue(
+        applicationElement,
+        kAXWindowsAttribute,
+        &windowsValue
+    );
+    if (error != kAXErrorSuccess || !windowsValue ||
+        CFGetTypeID(windowsValue) != CFArrayGetTypeID()) {
+        if (windowsValue) CFRelease(windowsValue);
+        CFRelease(applicationElement);
+        return @[];
+    }
+
+    CFArrayRef windows = (CFArrayRef)windowsValue;
+    NSMutableArray<NSValue *> *windowRefs = [NSMutableArray array];
+    CFIndex count = CFArrayGetCount(windows);
+    for (CFIndex index = 0; index < count; index++) {
+        AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
+        if (window) {
+            [windowRefs addObject:[NSValue valueWithPointer:window]];
+        }
+    }
+
+    CFRelease(windowsValue);
+    CFRelease(applicationElement);
+    return windowRefs;
+}
+
+- (void)showAccessibilityWindow:(AXUIElementRef)window
+                       application:(NSRunningApplication *)application {
+    if (!window) return;
+
+    [application unhide];
+    [application activateWithOptions:
+        NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
+
+    AXUIElementSetAttributeValue(
+        window,
+        kAXMinimizedAttribute,
+        kCFBooleanFalse
+    );
+    AXUIElementPerformAction(window, kAXRaiseAction);
+    AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
+    AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
+}
+
+- (void)showApplicationWithoutWindow:(NSRunningApplication *)application {
+    [application unhide];
+    [application activateWithOptions:
+        NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
+}
+
 - (void)toggleSlotNumber:(NSInteger)number {
     AppSlot *slot = nil;
     for (AppSlot *candidate in self.slots) {
@@ -301,32 +363,56 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
         }
     }
 
-    if (running) {
+    if (!running) {
+        NSURL *url = [NSURL fileURLWithPath:slot.path];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:slot.path]) {
+            NSWorkspaceOpenConfiguration *configuration =
+                [NSWorkspaceOpenConfiguration configuration];
+            [[NSWorkspace sharedWorkspace]
+                openApplicationAtURL:url
+                configuration:configuration
+                completionHandler:nil];
+            self.nextWindowIndices[slot.bundleIdentifier] = @0;
+            return;
+        }
+
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = [NSString stringWithFormat:@"找不到 %@", slot.name];
+        alert.informativeText = @"请检查应用是否安装在 Dock 显示的位置。";
+        alert.alertStyle = NSAlertStyleWarning;
+        [alert runModal];
+        return;
+    }
+
+    NSArray<NSValue *> *windows = [self accessibilityWindowsForApplication:running];
+    NSUInteger windowCount = windows.count;
+
+    if (windowCount <= 1) {
+        self.nextWindowIndices[slot.bundleIdentifier] = @0;
         if (running.active) {
             [running hide];
+        } else if (windowCount == 1) {
+            AXUIElementRef window = windows.firstObject.pointerValue;
+            [self showAccessibilityWindow:window application:running];
         } else {
-            [running activateWithOptions:
-                NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
+            [self showApplicationWithoutWindow:running];
         }
         return;
     }
 
-    NSURL *url = [NSURL fileURLWithPath:slot.path];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:slot.path]) {
-        NSWorkspaceOpenConfiguration *configuration =
-            [NSWorkspaceOpenConfiguration configuration];
-        [[NSWorkspace sharedWorkspace]
-            openApplicationAtURL:url
-            configuration:configuration
-            completionHandler:nil];
-        return;
+    NSInteger index = 0;
+    if (running.active &&
+        [self.knownWindowCounts[slot.bundleIdentifier] unsignedIntegerValue] == windowCount) {
+        index = [self.nextWindowIndices[slot.bundleIdentifier] integerValue];
+        if (index < 0 || index >= (NSInteger)windowCount) index = 0;
     }
 
-    NSAlert *alert = [NSAlert new];
-    alert.messageText = [NSString stringWithFormat:@"找不到 %@", slot.name];
-    alert.informativeText = @"请检查应用是否安装在 /Applications 中。";
-    alert.alertStyle = NSAlertStyleWarning;
-    [alert runModal];
+    AXUIElementRef window = windows[index].pointerValue;
+    [self showAccessibilityWindow:window application:running];
+
+    self.knownWindowCounts[slot.bundleIdentifier] = @(windowCount);
+    self.nextWindowIndices[slot.bundleIdentifier] =
+        @((index + 1) % (NSInteger)windowCount);
 }
 
 @end
