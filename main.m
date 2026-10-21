@@ -18,33 +18,15 @@
 @property(nonatomic, strong) NSArray<AppSlot *> *slots;
 @property(nonatomic) EventHandlerRef eventHandler;
 @property(nonatomic) NSMutableArray<NSValue *> *hotKeyRefs;
+@property(nonatomic) BOOL hotKeysActive;
+@property(nonatomic) AXError lastAccessibilityError;
 @property(nonatomic, strong) NSTimer *refreshTimer;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *nextWindowIndices;
-@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *knownWindowCounts;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSMutableArray<NSValue *> *> *windowOrders;
 - (void)toggleSlotNumber:(NSInteger)number;
+- (void)releaseAllWindowOrders;
+- (void)releaseWindowOrderForBundleIdentifier:(NSString *)bundleIdentifier;
 @end
-
-static OSStatus DockNumberHotKeyHandler(
-    EventHandlerCallRef nextHandler,
-    EventRef event,
-    void *userData
-) {
-    AppDelegate *delegate = (__bridge AppDelegate *)userData;
-    EventHotKeyID hotKeyID = {0};
-    OSStatus status = GetEventParameter(
-        event,
-        kEventParamDirectObject,
-        typeEventHotKeyID,
-        NULL,
-        sizeof(hotKeyID),
-        NULL,
-        &hotKeyID
-    );
-    if (status == noErr) {
-        [delegate toggleSlotNumber:(NSInteger)hotKeyID.id];
-    }
-    return noErr;
-}
 
 static AppSlot *Slot(
     NSInteger number,
@@ -67,6 +49,33 @@ static UInt32 KeyCodeForNumber(NSInteger number) {
     static const UInt32 keyCodes[] = {18, 19, 20, 21, 23, 22, 26, 28, 25};
     if (number < 1 || number > 9) return 0;
     return keyCodes[number - 1];
+}
+
+static BOOL SameAccessibilityWindow(AXUIElementRef first, AXUIElementRef second) {
+    if (!first || !second) return NO;
+    return first == second || CFEqual(first, second);
+}
+
+static OSStatus DockNumberHotKeyHandler(
+    EventHandlerCallRef nextHandler,
+    EventRef event,
+    void *userData
+) {
+    AppDelegate *delegate = (__bridge AppDelegate *)userData;
+    EventHotKeyID hotKeyID = {0};
+    OSStatus status = GetEventParameter(
+        event,
+        kEventParamDirectObject,
+        typeEventHotKeyID,
+        NULL,
+        sizeof(hotKeyID),
+        NULL,
+        &hotKeyID
+    );
+    if (status == noErr && hotKeyID.signature == 'DNHK') {
+        [delegate toggleSlotNumber:(NSInteger)hotKeyID.id];
+    }
+    return noErr;
 }
 
 static NSArray<AppSlot *> *ReadDockSlots(void) {
@@ -146,11 +155,13 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     self.slots = ReadDockSlots();
     self.nextWindowIndices = [NSMutableDictionary dictionary];
-    self.knownWindowCounts = [NSMutableDictionary dictionary];
+    self.windowOrders = [NSMutableDictionary dictionary];
+    self.lastAccessibilityError = kAXErrorSuccess;
 
     [self createStatusItem];
     [self installHotKeyHandler];
     [self registerHotKeys];
+    [self rebuildMenu];
     self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                            target:self
                                                          selector:@selector(refreshDockSlots)
@@ -160,15 +171,18 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     [self unregisterHotKeys];
+    if (self.refreshTimer) [self.refreshTimer invalidate];
+    [self releaseAllWindowOrders];
     if (self.eventHandler) {
         RemoveEventHandler(self.eventHandler);
+        self.eventHandler = NULL;
     }
 }
 
 - (void)createStatusItem {
     self.statusItem = [[NSStatusBar systemStatusBar]
         statusItemWithLength:24.0];
-    self.statusItem.button.title = @"⌘";
+    self.statusItem.button.title = @"⌥";
     [self rebuildMenu];
 }
 
@@ -184,7 +198,7 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
 
     for (AppSlot *slot in self.slots) {
         NSMenuItem *item = [[NSMenuItem alloc]
-            initWithTitle:[NSString stringWithFormat:@"⌘%ld  %@", (long)slot.number, slot.name]
+        initWithTitle:[NSString stringWithFormat:@"⌥%ld  %@", (long)slot.number, slot.name]
             action:@selector(openFromMenu:)
             keyEquivalent:@""];
         item.target = self;
@@ -193,8 +207,20 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     }
 
     [menu addItem:[NSMenuItem separatorItem]];
+    NSString *infoTitle = nil;
+    if (!self.hotKeysActive) {
+        infoTitle = @"快捷键未启动：系统没有接受快捷键注册";
+    } else if (self.lastAccessibilityError == kAXErrorAPIDisabled) {
+        infoTitle = @"快捷键已触发，但辅助功能未生效（AX -25211）";
+    } else if (self.lastAccessibilityError != kAXErrorSuccess) {
+        infoTitle = [NSString stringWithFormat:
+            @"窗口读取失败（AX 错误 %d），请重新添加当前应用",
+            self.lastAccessibilityError];
+    } else {
+        infoTitle = @"自动读取 Dock 当前顺序";
+    }
     NSMenuItem *info = [[NSMenuItem alloc]
-        initWithTitle:@"自动读取 Dock 当前顺序"
+        initWithTitle:infoTitle
         action:nil
         keyEquivalent:@""];
     info.enabled = NO;
@@ -246,7 +272,7 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
         .eventClass = kEventClassKeyboard,
         .eventKind = kEventHotKeyPressed
     };
-    InstallEventHandler(
+    OSStatus status = InstallEventHandler(
         GetApplicationEventTarget(),
         NewEventHandlerUPP(DockNumberHotKeyHandler),
         1,
@@ -254,44 +280,62 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
         (__bridge void *)self,
         &_eventHandler
     );
+    if (status != noErr) self.eventHandler = NULL;
 }
 
 - (void)registerHotKeys {
     self.hotKeyRefs = [NSMutableArray arrayWithCapacity:self.slots.count];
+    self.hotKeysActive = (self.eventHandler != NULL);
     OSType signature = 'DNHK';
+
     for (AppSlot *slot in self.slots) {
         EventHotKeyID hotKeyID = {
             .signature = signature,
             .id = (UInt32)slot.number
         };
         EventHotKeyRef ref = NULL;
-        RegisterEventHotKey(
+        OSStatus status = RegisterEventHotKey(
             slot.keyCode,
-            cmdKey,
+            optionKey,
             hotKeyID,
             GetApplicationEventTarget(),
             0,
             &ref
         );
-        [self.hotKeyRefs addObject:[NSValue valueWithPointer:ref]];
+        if (status != noErr || !ref) {
+            self.hotKeysActive = NO;
+        } else {
+            [self.hotKeyRefs addObject:[NSValue valueWithPointer:ref]];
+        }
+    }
+    if (!self.hotKeysActive) {
+        for (NSValue *value in self.hotKeyRefs) {
+            EventHotKeyRef ref = value.pointerValue;
+            if (ref) UnregisterEventHotKey(ref);
+        }
+        self.hotKeyRefs = [NSMutableArray array];
+        self.statusItem.button.title = @"!";
+    } else {
+        self.statusItem.button.title = @"⌥";
     }
 }
 
 - (void)unregisterHotKeys {
     for (NSValue *value in self.hotKeyRefs) {
-        EventHotKeyRef ref = NULL;
-        [value getValue:&ref];
-        if (ref) {
-            UnregisterEventHotKey(ref);
-        }
+        EventHotKeyRef ref = value.pointerValue;
+        if (ref) UnregisterEventHotKey(ref);
     }
     self.hotKeyRefs = [NSMutableArray array];
+    self.hotKeysActive = NO;
 }
 
 - (NSArray<NSValue *> *)accessibilityWindowsForApplication:(NSRunningApplication *)application {
     AXUIElementRef applicationElement =
         AXUIElementCreateApplication(application.processIdentifier);
-    if (!applicationElement) return @[];
+    if (!applicationElement) {
+        self.lastAccessibilityError = kAXErrorFailure;
+        return nil;
+    }
 
     CFTypeRef windowsValue = NULL;
     AXError error = AXUIElementCopyAttributeValue(
@@ -303,7 +347,9 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
         CFGetTypeID(windowsValue) != CFArrayGetTypeID()) {
         if (windowsValue) CFRelease(windowsValue);
         CFRelease(applicationElement);
-        return @[];
+        self.lastAccessibilityError =
+            error == kAXErrorSuccess ? kAXErrorFailure : error;
+        return nil;
     }
 
     CFArrayRef windows = (CFArrayRef)windowsValue;
@@ -312,28 +358,108 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     for (CFIndex index = 0; index < count; index++) {
         AXUIElementRef window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
         if (window) {
+            // Keep the AX element alive after the returned CFArray is released.
+            CFRetain(window);
             [windowRefs addObject:[NSValue valueWithPointer:window]];
         }
     }
 
     CFRelease(windowsValue);
     CFRelease(applicationElement);
+    self.lastAccessibilityError = kAXErrorSuccess;
     return windowRefs;
 }
 
+- (void)releaseAccessibilityWindows:(NSArray<NSValue *> *)windows {
+    for (NSValue *value in windows) {
+        AXUIElementRef window = value.pointerValue;
+        if (window) CFRelease(window);
+    }
+}
+
+- (void)releaseAllWindowOrders {
+    for (NSString *bundleIdentifier in [self.windowOrders.allKeys copy]) {
+        [self releaseWindowOrderForBundleIdentifier:bundleIdentifier];
+    }
+    [self.windowOrders removeAllObjects];
+}
+
+- (void)releaseWindowOrderForBundleIdentifier:(NSString *)bundleIdentifier {
+    NSArray<NSValue *> *order = self.windowOrders[bundleIdentifier];
+    for (NSValue *value in order) {
+        AXUIElementRef window = value.pointerValue;
+        if (window) CFRelease(window);
+    }
+    [self.windowOrders removeObjectForKey:bundleIdentifier];
+}
+
+- (NSArray<NSValue *> *)stableWindowOrderForBundleIdentifier:(NSString *)bundleIdentifier
+                                                     windows:(NSArray<NSValue *> *)windows {
+    NSMutableArray<NSValue *> *order = self.windowOrders[bundleIdentifier];
+    if (!order) {
+        order = [NSMutableArray array];
+        self.windowOrders[bundleIdentifier] = order;
+    }
+
+    // Remove windows that were closed since the previous shortcut press.
+    for (NSInteger index = order.count - 1; index >= 0; index--) {
+        NSValue *stored = order[index];
+        BOOL stillExists = NO;
+        for (NSValue *current in windows) {
+            if (SameAccessibilityWindow(stored.pointerValue, current.pointerValue)) {
+                stillExists = YES;
+                break;
+            }
+        }
+        if (!stillExists) {
+            AXUIElementRef window = stored.pointerValue;
+            if (window) CFRelease(window);
+            [order removeObjectAtIndex:index];
+        }
+    }
+
+    // Append newly created windows without changing the order of existing ones.
+    for (NSValue *current in windows) {
+        BOOL alreadyStored = NO;
+        for (NSValue *stored in order) {
+            if (SameAccessibilityWindow(stored.pointerValue, current.pointerValue)) {
+                alreadyStored = YES;
+                break;
+            }
+        }
+        if (!alreadyStored && current.pointerValue) {
+            CFRetain(current.pointerValue);
+            [order addObject:current];
+        }
+    }
+
+    return [order copy];
+}
+
 - (void)showAccessibilityWindow:(AXUIElementRef)window
-                       application:(NSRunningApplication *)application {
+                       application:(NSRunningApplication *)application
+                       allWindows:(NSArray<NSValue *> *)windows {
     if (!window) return;
 
-    [application unhide];
-    [application activateWithOptions:
-        NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
-
+    // Keep the other windows open, but make only the selected one visible.
+    // This avoids macOS bringing every window forward when the app activates.
+    for (NSValue *value in windows) {
+        AXUIElementRef otherWindow = value.pointerValue;
+        if (otherWindow && !SameAccessibilityWindow(otherWindow, window)) {
+            AXUIElementSetAttributeValue(
+                otherWindow,
+                kAXMinimizedAttribute,
+                kCFBooleanTrue
+            );
+        }
+    }
     AXUIElementSetAttributeValue(
         window,
         kAXMinimizedAttribute,
         kCFBooleanFalse
     );
+    [application unhide];
+    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
     AXUIElementPerformAction(window, kAXRaiseAction);
     AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
     AXUIElementSetAttributeValue(window, kAXFocusedAttribute, kCFBooleanTrue);
@@ -341,8 +467,7 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
 
 - (void)showApplicationWithoutWindow:(NSRunningApplication *)application {
     [application unhide];
-    [application activateWithOptions:
-        NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps];
+    [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
 }
 
 - (void)toggleSlotNumber:(NSInteger)number {
@@ -364,6 +489,7 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     }
 
     if (!running) {
+        [self releaseWindowOrderForBundleIdentifier:slot.bundleIdentifier];
         NSURL *url = [NSURL fileURLWithPath:slot.path];
         if ([[NSFileManager defaultManager] fileExistsAtPath:slot.path]) {
             NSWorkspaceOpenConfiguration *configuration =
@@ -385,34 +511,54 @@ static NSArray<AppSlot *> *ReadDockSlots(void) {
     }
 
     NSArray<NSValue *> *windows = [self accessibilityWindowsForApplication:running];
+    if (!windows) {
+        [self releaseWindowOrderForBundleIdentifier:slot.bundleIdentifier];
+        self.nextWindowIndices[slot.bundleIdentifier] = @0;
+        [self rebuildMenu];
+        return;
+    }
     NSUInteger windowCount = windows.count;
 
     if (windowCount <= 1) {
+        [self releaseWindowOrderForBundleIdentifier:slot.bundleIdentifier];
         self.nextWindowIndices[slot.bundleIdentifier] = @0;
         if (running.active) {
             [running hide];
         } else if (windowCount == 1) {
             AXUIElementRef window = windows.firstObject.pointerValue;
-            [self showAccessibilityWindow:window application:running];
+            [self showAccessibilityWindow:window
+                             application:running
+                             allWindows:windows];
         } else {
             [self showApplicationWithoutWindow:running];
         }
+        [self releaseAccessibilityWindows:windows];
+        return;
+    }
+
+    NSArray<NSValue *> *orderedWindows =
+        [self stableWindowOrderForBundleIdentifier:slot.bundleIdentifier
+                                           windows:windows];
+    NSUInteger orderedWindowCount = orderedWindows.count;
+    if (orderedWindowCount == 0) {
+        [self releaseAccessibilityWindows:windows];
         return;
     }
 
     NSInteger index = 0;
-    if (running.active &&
-        [self.knownWindowCounts[slot.bundleIdentifier] unsignedIntegerValue] == windowCount) {
+    if (running.active) {
         index = [self.nextWindowIndices[slot.bundleIdentifier] integerValue];
-        if (index < 0 || index >= (NSInteger)windowCount) index = 0;
+        if (index < 0 || index >= (NSInteger)orderedWindowCount) index = 0;
     }
 
-    AXUIElementRef window = windows[index].pointerValue;
-    [self showAccessibilityWindow:window application:running];
+    AXUIElementRef window = orderedWindows[index].pointerValue;
+    [self showAccessibilityWindow:window
+                     application:running
+                     allWindows:windows];
 
-    self.knownWindowCounts[slot.bundleIdentifier] = @(windowCount);
     self.nextWindowIndices[slot.bundleIdentifier] =
-        @((index + 1) % (NSInteger)windowCount);
+        @((index + 1) % (NSInteger)orderedWindowCount);
+    [self releaseAccessibilityWindows:windows];
 }
 
 @end
