@@ -16,7 +16,8 @@ mkdir -p "$MACOS" "$CONTENTS/Resources"
   "$ROOT/main.m" \
   -o "$MACOS/DockNumberShortcut" \
   -framework Cocoa \
-  -framework Carbon
+  -framework Carbon \
+  -framework ApplicationServices
 
 cat > "$CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -34,13 +35,26 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
 </plist>
 PLIST
+
+# Remove inherited provenance/quarantine metadata before registering the bundle.
+/usr/bin/xattr -cr "$APP" 2>/dev/null || true
+
+# Use an ad-hoc signature with a stable designated requirement. This keeps
+# macOS Privacy & Security authorization associated with the bundle ID across
+# local rebuilds, instead of binding it to each changing code hash.
+/usr/bin/codesign \
+  --force \
+  --deep \
+  --sign - \
+  --requirements '=designated => identifier "local.dock-number-shortcut"' \
+  "$APP" >/dev/null
 
 echo "Built: $APP"
